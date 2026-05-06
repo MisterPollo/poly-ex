@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "Polymarket BTC 5min Auto Trader",
+  "version": "1.0.0",
+  "description": "Automated trading bot for Polymarket BTC 5-minute Up/Down markets",
+  "permissions": [
+    "storage",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "https://polymarket.com/*",
+    "https://gamma-api.polymarket.com/*",
+    "https://clob.polymarket.com/*"
+  ],
+  "action": {},
+  "content_scripts": [
+    {
+      "matches": ["https://polymarket.com/event/btc-updown-5m-*"],
+      "js": ["content.js", "panel.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["panel.html"],
+      "matches": ["https://polymarket.com/*"]
+    }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  }
+}
