@@ -73,13 +73,16 @@ const POLYMARKET_API = {
     const marketTimestamp = parseInt(urlMatch[2]);
     const slug = this.getMarketSlug(marketTimestamp, marketType);
 
+    // Store market end time globally for accurate real-time calculations
+    marketTimestampFromURL = (marketTimestamp + 300) * 1000;
+
     const market = await this.getMarketBySlug(slug);
     if (!market) return null;
 
-    // Calculate time remaining from slug timestamp
-    const marketEndTime = (marketTimestamp + 300) * 1000; // Add 5 minutes
+    // IMPORTANT: Calculate time remaining using current time, NOT cached time
+    // This ensures timer is always accurate even if API is slow
     const now = Date.now();
-    const timeRemainingSeconds = Math.max(0, Math.floor((marketEndTime - now) / 1000));
+    const timeRemainingSeconds = Math.max(0, Math.floor((marketTimestampFromURL - now) / 1000));
 
     // Get tokens (UP and DOWN)
     let upPrice = 0.5, downPrice = 0.5;
@@ -178,9 +181,10 @@ const POLYMARKET_API = {
   }
 };
 
-// Global variable to cache market data
+// Global variable to cache market data (but NOT time remaining)
 let cachedMarketData = null;
 let lastFetchTime = 0;
+let marketTimestampFromURL = null; // Store the market end timestamp for accurate time calculations
 
 // Updated selectors based on actual Polymarket page structure
 const SELECTORS = {
@@ -205,9 +209,22 @@ const SELECTORS = {
   nextMarketButton: 'a[href*="btc-updown-5m-"]' // ✅ Matches any link with "btc-updown-5m-" followed by timestamp
 };
 
-// Generate unique instance ID for this tab
-const INSTANCE_ID = `bot_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-console.log(`[Bot] Instance ID: ${INSTANCE_ID}`);
+// Generate unique instance ID for this tab (used for storage isolation)
+// Persist across page reloads using sessionStorage (tab-specific, cleared when tab closes)
+let INSTANCE_ID;
+if (window.sessionStorage.getItem('BOT_INSTANCE_ID')) {
+  INSTANCE_ID = window.sessionStorage.getItem('BOT_INSTANCE_ID');
+  console.log(`[Bot] Reusing existing Instance ID: ${INSTANCE_ID}`);
+} else {
+  INSTANCE_ID = `bot_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  window.sessionStorage.setItem('BOT_INSTANCE_ID', INSTANCE_ID);
+  console.log(`[Bot] Created new Instance ID: ${INSTANCE_ID}`);
+}
+
+// Storage key helpers - all storage is now scoped to this instance
+function getStorageKey(key) {
+  return `${INSTANCE_ID}_${key}`;
+}
 
 // Detect current market type from URL
 function detectMarketType() {
@@ -222,10 +239,13 @@ function detectMarketType() {
 
 // Initialize market type (async) with a promise we can await
 window.MARKET_TYPE_READY = (async function() {
-  const { selectedMarket } = await chrome.storage.local.get('selectedMarket');
+  const storageKey = getStorageKey('selectedMarket');
+  const data = await chrome.storage.local.get(storageKey);
+  const selectedMarket = data[storageKey];
+
   if (selectedMarket) {
     window.MARKET_TYPE = selectedMarket;
-    console.log(`[Bot] Using stored market preference: ${window.MARKET_TYPE}`);
+    console.log(`[Bot] Using stored market preference for this tab: ${window.MARKET_TYPE}`);
   } else {
     window.MARKET_TYPE = detectMarketType();
     console.log(`[Bot] Detected market from URL: ${window.MARKET_TYPE}`);
@@ -248,7 +268,9 @@ let botState = {
   lastTradeWon: null,
   checkInterval: null,
   stakePreFilled: false,
-  tradeDirection: null // Track which direction we traded for win/loss detection
+  tradeDirection: null, // Track which direction we traded for win/loss detection
+  lastTimeRemaining: null, // Track timer to detect if it gets stuck
+  timeStuckCounter: 0 // Count how many cycles timer hasn't decreased
 };
 
 // Listen for messages from popup
@@ -340,8 +362,9 @@ async function startBot() {
 
       // Only navigate if we're not already going to this URL
       if (!currentUrl.includes(activeSlug)) {
-        // Set flag so bot auto-starts after navigation
-        await chrome.storage.local.set({ botRunning: true });
+        // Set flag so bot auto-starts after navigation (instance-specific)
+        const storageKey = getStorageKey('botRunning');
+        await chrome.storage.local.set({ [storageKey]: true });
         window.location.href = activeUrl;
         return; // Stop here, bot will auto-start on new page
       } else {
@@ -454,12 +477,31 @@ async function monitorMarket() {
       return;
     }
 
-    // Check if market has resolved (timer reached 0)
+    // Check if market has resolved (timer reached 0 or negative)
     if (timeRemaining <= 0) {
-      console.log('[Bot] Market resolved, navigating to next market...');
+      console.log('[Bot] Market resolved (timer <= 0), navigating to next market...');
       navigateToNextMarket();
       return;
     }
+
+    // STUCK TIMER DETECTION: If timer hasn't decreased in 10 seconds, force navigation
+    if (botState.lastTimeRemaining !== null) {
+      // Timer should always be decreasing (or stay same within 1 second due to caching)
+      if (timeRemaining >= botState.lastTimeRemaining) {
+        botState.timeStuckCounter++;
+        if (botState.timeStuckCounter >= 20) { // 20 checks * 500ms = 10 seconds stuck
+          console.log(`[Bot] ⚠️ Timer stuck at ${timeRemaining}s for 10+ seconds, forcing navigation...`);
+          sendStatusUpdate('error', 'Timer stuck, forcing market refresh...');
+          botState.timeStuckCounter = 0;
+          navigateToNextMarket();
+          return;
+        }
+      } else {
+        // Timer is decreasing normally, reset counter
+        botState.timeStuckCounter = 0;
+      }
+    }
+    botState.lastTimeRemaining = timeRemaining;
 
     // Calculate current stake (considering martingale)
     botState.currentStake = botState.settings.stake * Math.pow(botState.settings.martingaleMultiplier, botState.martingaleStep);
@@ -569,9 +611,9 @@ function executeScaling(direction, probability) {
 // Helper functions to interact with page elements
 
 async function getMarketData() {
-  // Use cached data if fetched recently (within 1 second)
+  // Use cached data if fetched recently (within 500ms for fresher data)
   const now = Date.now();
-  if (cachedMarketData && (now - lastFetchTime) < 1000) {
+  if (cachedMarketData && (now - lastFetchTime) < 500) {
     return cachedMarketData;
   }
 
@@ -584,10 +626,27 @@ async function getMarketData() {
 
 async function getTimeRemaining() {
   try {
+    // CRITICAL FIX: Calculate time remaining in real-time, not from cached data
+    // This prevents timer desync issues when API is slow
+
+    // If we have the market end timestamp from URL, calculate directly
+    if (marketTimestampFromURL) {
+      const now = Date.now();
+      const timeRemaining = Math.max(0, Math.floor((marketTimestampFromURL - now) / 1000));
+      return timeRemaining;
+    }
+
+    // Fallback: fetch market data (this also sets marketTimestampFromURL)
     const marketData = await getMarketData();
     if (!marketData) {
       console.warn('[Bot] No market data available');
       return 0;
+    }
+
+    // Recalculate time with current timestamp (don't use cached value)
+    const now = Date.now();
+    if (marketTimestampFromURL) {
+      return Math.max(0, Math.floor((marketTimestampFromURL - now) / 1000));
     }
 
     return marketData.timeRemainingSeconds;
@@ -844,7 +903,10 @@ async function navigateToNextMarket() {
     botState.scalingExecuted = false;
     botState.stakePreFilled = false;
     botState.tradeDirection = null;
+    botState.lastTimeRemaining = null; // Reset timer tracking
+    botState.timeStuckCounter = 0; // Reset stuck counter
     cachedMarketData = null; // Clear cache
+    marketTimestampFromURL = null; // Clear cached timestamp
 
     // Persist martingale state before navigation
     await saveMartingaleState();
@@ -861,34 +923,40 @@ async function navigateToNextMarket() {
 }
 
 function sendStatusUpdate(status, details) {
+  // Send to background script
   chrome.runtime.sendMessage({
     type: 'STATUS_UPDATE',
     status,
     details
   });
+
+  // ALSO dispatch custom event for panel.js (runs in same page context)
+  window.dispatchEvent(new CustomEvent('bot-status-update', {
+    detail: { status, details }
+  }));
 }
 
-// Martingale persistence functions (per market)
+// Martingale persistence functions (per market AND per instance)
 async function saveMartingaleState() {
-  const martingaleKey = `martingale_${MARKET_TYPE}`;
+  const martingaleKey = getStorageKey(`martingale_${window.MARKET_TYPE}`);
   await chrome.storage.local.set({
     [martingaleKey]: {
       step: botState.martingaleStep,
       lastWon: botState.lastTradeWon
     }
   });
-  console.log(`[Bot] Saved ${window.MARKET_TYPE} martingale state: step=${botState.martingaleStep}, lastWon=${botState.lastTradeWon}`);
+  console.log(`[Bot] Saved ${window.MARKET_TYPE} martingale state for this tab: step=${botState.martingaleStep}, lastWon=${botState.lastTradeWon}`);
 }
 
 async function restoreMartingaleState() {
-  const martingaleKey = `martingale_${MARKET_TYPE}`;
+  const martingaleKey = getStorageKey(`martingale_${window.MARKET_TYPE}`);
   const data = await chrome.storage.local.get([martingaleKey]);
   const savedMartingale = data[martingaleKey] || {};
 
   if (savedMartingale.step !== undefined) {
     botState.martingaleStep = savedMartingale.step;
     botState.lastTradeWon = savedMartingale.lastWon;
-    console.log(`[Bot] Restored ${window.MARKET_TYPE} martingale state: step=${savedMartingale.step}, lastWon=${savedMartingale.lastWon}`);
+    console.log(`[Bot] Restored ${window.MARKET_TYPE} martingale state for this tab: step=${savedMartingale.step}, lastWon=${savedMartingale.lastWon}`);
   }
 }
 

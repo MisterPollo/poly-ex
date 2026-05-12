@@ -2,6 +2,12 @@
 // ===== FLOATING PANEL UI =====
 // Inject floating panel into page
 
+// Storage key helpers - use INSTANCE_ID from content.js for tab isolation
+function getStorageKey(key) {
+  // window.INSTANCE_ID is set by content.js before panel.js runs
+  return window.INSTANCE_ID ? `${window.INSTANCE_ID}_${key}` : key;
+}
+
 async function injectFloatingPanel() {
   try {
     // Check if panel already exists
@@ -35,8 +41,61 @@ async function injectFloatingPanel() {
       .console-line.success { color: #22c55e; }
       .console-line.error { color: #ef4444; }
       .console-line.warning { color: #eab308; }
+
+      /* Trade flash animation */
+      @keyframes tradeFlash {
+        0%, 100% { box-shadow: 0 10px 40px rgba(0, 0, 0, 0.8); }
+        25% { box-shadow: 0 0 0 3px #eab308, 0 10px 40px rgba(234, 179, 8, 0.6); }
+        50% { box-shadow: 0 0 0 6px #eab308, 0 10px 40px rgba(234, 179, 8, 0.8); }
+        75% { box-shadow: 0 0 0 3px #eab308, 0 10px 40px rgba(234, 179, 8, 0.6); }
+      }
+      #polymarket-bot-panel.trade-flash {
+        animation: tradeFlash 0.6s ease-out;
+      }
+
+      /* Zoom-independent panel - multiple approaches for browser compatibility */
+      #polymarket-bot-panel {
+        /* Method 1: CSS zoom property */
+        zoom: 1 !important;
+        -moz-transform: scale(1) !important;
+
+        /* Method 2: Force specific size calculations */
+        font-size: 13px !important;
+
+        /* Method 3: Disable CSS zoom inheritance */
+        all: initial;
+
+        /* Re-apply essential styles after 'all: initial' reset */
+        position: fixed !important;
+        top: 100px !important;
+        left: 20px !important;
+        width: 380px !important;
+        min-width: 300px !important;
+        min-height: 250px !important;
+        max-width: 700px !important;
+        max-height: 90vh !important;
+        resize: both !important;
+        overflow: hidden !important;
+        background: #111111 !important;
+        border: 1px solid #2a2a2a !important;
+        border-radius: 8px !important;
+        box-shadow: 0 10px 40px rgba(0, 0, 0, 0.8) !important;
+        z-index: 999999 !important;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
+        color: #e5e5e5 !important;
+        font-size: 13px !important;
+        display: flex !important;
+        flex-direction: column !important;
+        zoom: 1 !important;
+      }
+
+      /* Override any inherited zoom on all child elements */
+      #polymarket-bot-panel * {
+        zoom: normal !important;
+      }
     `;
     document.head.appendChild(style);
+    console.log('[Panel] Zoom-independent CSS injected');
 
     // Inline the HTML directly
     const panelHTML = `
@@ -277,7 +336,8 @@ function setupFloatingPanel() {
 
   closeBtn.addEventListener('click', async () => {
     panel.style.display = 'none';
-    await chrome.storage.local.set({ floatingPanelVisible: false });
+    const storageKey = getStorageKey('floatingPanelVisible');
+    await chrome.storage.local.set({ [storageKey]: false });
   });
 
   // Market selector - Change market type
@@ -291,8 +351,9 @@ function setupFloatingPanel() {
     // Update global MARKET_TYPE
     window.MARKET_TYPE = newMarketType;
 
-    // PERSIST the selected market so it survives page reload
-    await chrome.storage.local.set({ selectedMarket: newMarketType });
+    // PERSIST the selected market so it survives page reload (instance-specific)
+    const storageKey = getStorageKey('selectedMarket');
+    await chrome.storage.local.set({ [storageKey]: newMarketType });
 
     console.log('[Panel] After: window.MARKET_TYPE =', window.MARKET_TYPE);
     console.log('[Panel] Saved selectedMarket to storage:', newMarketType);
@@ -477,12 +538,16 @@ function setupFloatingPanel() {
   const softBtn = document.getElementById('floatSoftStartBtn');
   softBtn.addEventListener('click', async (e) => {
     e.stopPropagation(); // Prevent dragging
-    const { softStartRunning } = await chrome.storage.local.get('softStartRunning');
+    const softKey = getStorageKey('softStartRunning');
+    const botKey = getStorageKey('botRunning');
+
+    const data = await chrome.storage.local.get([softKey]);
+    const softStartRunning = data[softKey];
     const newState = !softStartRunning;
 
     await chrome.storage.local.set({
-      softStartRunning: newState,
-      botRunning: false // Make sure full bot is off
+      [softKey]: newState,
+      [botKey]: false // Make sure full bot is off
     });
 
     if (newState) {
@@ -505,14 +570,18 @@ function setupFloatingPanel() {
     console.log('[Panel] Start button clicked');
     addFloatingConsoleLog('info', 'Start button clicked');
 
-    const { botRunning } = await chrome.storage.local.get('botRunning');
+    const softKey = getStorageKey('softStartRunning');
+    const botKey = getStorageKey('botRunning');
+
+    const data = await chrome.storage.local.get([botKey]);
+    const botRunning = data[botKey];
     console.log('[Panel] Current botRunning state:', botRunning);
     const newState = !botRunning;
     console.log('[Panel] New state will be:', newState);
 
     await chrome.storage.local.set({
-      botRunning: newState,
-      softStartRunning: false // Turn off soft mode
+      [botKey]: newState,
+      [softKey]: false // Turn off soft mode
     });
 
     // Call window functions exposed by content.js
@@ -615,7 +684,12 @@ async function checkAndRestoreBotState() {
   // Wait a moment for window.MARKET_TYPE to be initialized from storage
   await new Promise(resolve => setTimeout(resolve, 500));
 
-  const { botRunning, softStartRunning } = await chrome.storage.local.get(['botRunning', 'softStartRunning']);
+  const softKey = getStorageKey('softStartRunning');
+  const botKey = getStorageKey('botRunning');
+
+  const data = await chrome.storage.local.get([botKey, softKey]);
+  const botRunning = data[botKey];
+  const softStartRunning = data[softKey];
   const softBtn = document.getElementById('floatSoftStartBtn');
 
   if (softStartRunning) {
@@ -1004,22 +1078,66 @@ window.sendStatusUpdate = function(status, details) {
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'TOGGLE_PANEL' || message.action === 'toggleFloatingPanel') {
     const panel = document.getElementById('polymarket-bot-panel');
+    const storageKey = getStorageKey('floatingPanelVisible');
+
     if (panel) {
       const isVisible = panel.style.display !== 'none';
       panel.style.display = isVisible ? 'none' : 'block';
-      chrome.storage.local.set({ floatingPanelVisible: !isVisible });
+      chrome.storage.local.set({ [storageKey]: !isVisible });
     } else {
       injectFloatingPanel();
-      chrome.storage.local.set({ floatingPanelVisible: true });
+      chrome.storage.local.set({ [storageKey]: true });
     }
     sendResponse({ success: true });
   }
+
   return true;
 });
 
+// Listen for status updates from content.js via custom events (same page context)
+window.addEventListener('bot-status-update', (event) => {
+  const { status, details } = event.detail;
+  const panel = document.getElementById('polymarket-bot-panel');
+
+  console.log('[Panel] Status update received:', status, details);
+
+  // Flash yellow outline when trade is placed
+  if (status === 'trade_placed' || status === 'scaling_placed') {
+    if (panel) {
+      console.log('[Panel] Trade detected, flashing yellow!');
+      panel.classList.add('trade-flash');
+      setTimeout(() => {
+        panel.classList.remove('trade-flash');
+        console.log('[Panel] Flash animation complete');
+      }, 600); // Match animation duration
+    } else {
+      console.log('[Panel] Panel element not found!');
+    }
+
+    // Log to console
+    if (window.addFloatingConsoleLog) {
+      addFloatingConsoleLog('success', details);
+    }
+  }
+});
+
+// Test function - call this in console: window.testTradeFlash()
+window.testTradeFlash = function() {
+  console.log('[Panel] Testing trade flash animation...');
+  window.dispatchEvent(new CustomEvent('bot-status-update', {
+    detail: {
+      status: 'trade_placed',
+      details: '✅ TEST trade: $1.00 @ 75.0%'
+    }
+  }));
+};
+
 // Auto-inject panel if it was visible before navigation
 setTimeout(async () => {
-  const { floatingPanelVisible } = await chrome.storage.local.get({ floatingPanelVisible: false });
+  const storageKey = getStorageKey('floatingPanelVisible');
+  const data = await chrome.storage.local.get({ [storageKey]: false });
+  const floatingPanelVisible = data[storageKey];
+
   if (floatingPanelVisible) {
     console.log('[Panel] Restoring panel after navigation');
     injectFloatingPanel();
