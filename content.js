@@ -21,9 +21,10 @@ const POLYMARKET_API = {
     return Math.ceil(now / 300) * 300;
   },
 
-  // Generate market slug from timestamp
-  getMarketSlug(timestamp) {
-    return `btc-updown-5m-${timestamp}`;
+  // Generate market slug from timestamp (supports BTC, ETH, SOL, XRP, DOGE)
+  getMarketSlug(timestamp, marketType = 'BTC') {
+    const prefix = marketType.toLowerCase();
+    return `${prefix}-updown-5m-${timestamp}`;
   },
 
   // Fetch market by slug
@@ -61,15 +62,16 @@ const POLYMARKET_API = {
 
   // Get current market data including prices and time remaining
   async getCurrentMarketData() {
-    // Extract slug from current URL
-    const urlMatch = window.location.pathname.match(/btc-updown-5m-(\d+)/);
+    // Extract slug from current URL - supports all market types
+    const urlMatch = window.location.pathname.match(/(btc|eth|sol|xrp|doge)-updown-5m-(\d+)/);
     if (!urlMatch) {
-      console.warn('[API] Not on a BTC 5-min market page');
+      console.warn('[API] Not on a 5-min market page');
       return null;
     }
 
-    const marketTimestamp = parseInt(urlMatch[1]);
-    const slug = this.getMarketSlug(marketTimestamp);
+    const marketType = urlMatch[1].toUpperCase();
+    const marketTimestamp = parseInt(urlMatch[2]);
+    const slug = this.getMarketSlug(marketTimestamp, marketType);
 
     const market = await this.getMarketBySlug(slug);
     if (!market) return null;
@@ -118,6 +120,61 @@ const POLYMARKET_API = {
   async getNextMarketSlug() {
     const nextTs = this.getNextMarketTimestamp();
     return this.getMarketSlug(nextTs);
+  },
+
+  // Get current active market slug (finds the one that's actually tradeable NOW)
+  async getCurrentActiveMarketSlug(marketType = 'BTC') {
+    const nowMs = Date.now();
+    const now = Math.floor(nowMs / 1000);
+
+    // Market slug timestamp is the START TIME of the market
+    // Market runs from: timestamp to (timestamp + 300)
+
+    // Get current 5-min bucket start
+    const currentStart = this.getCurrentMarketTimestamp();
+
+    // Calculate time remaining using the SAME logic as getCurrentMarketData() (line 78-80)
+    const marketEndTime = (currentStart + 300) * 1000; // milliseconds
+    const timeRemaining = Math.max(0, Math.floor((marketEndTime - nowMs) / 1000));
+
+    console.log(`[API] Current ${marketType} market ${currentStart}: timeRemaining=${timeRemaining}s`);
+
+    // CRITICAL: Only return this market if timeRemaining is 0-300 seconds (same validation as monitorMarket line 403)
+    if (timeRemaining > 0 && timeRemaining <= 300) {
+      const slug = this.getMarketSlug(currentStart, marketType);
+      const market = await this.getMarketBySlug(slug);
+
+      if (market && market.active && !market.closed) {
+        console.log(`[API] ✅ Found current active ${marketType} market: ${slug} (${timeRemaining}s remaining)`);
+        return slug;
+      } else {
+        console.log(`[API] Current ${marketType} market ${slug} exists but not active/open`);
+      }
+    } else {
+      console.log(`[API] Current ${marketType} market timeRemaining=${timeRemaining} is outside 0-300 range, trying next...`);
+    }
+
+    // Try next market window
+    const nextStart = currentStart + 300;
+    const nextMarketEndTime = (nextStart + 300) * 1000;
+    const nextTimeRemaining = Math.max(0, Math.floor((nextMarketEndTime - nowMs) / 1000));
+
+    console.log(`[API] Next ${marketType} market ${nextStart}: timeRemaining=${nextTimeRemaining}s`);
+
+    if (nextTimeRemaining > 0 && nextTimeRemaining <= 300) {
+      const nextSlug = this.getMarketSlug(nextStart, marketType);
+      const nextMarket = await this.getMarketBySlug(nextSlug);
+
+      if (nextMarket && nextMarket.active && !nextMarket.closed) {
+        console.log(`[API] ✅ Found next active ${marketType} market: ${nextSlug} (${nextTimeRemaining}s remaining)`);
+        return nextSlug;
+      }
+    }
+
+    // Fallback: return current bucket (shouldn't happen but just in case)
+    const fallbackSlug = this.getMarketSlug(currentStart, marketType);
+    console.log(`[API] ⚠️ Using fallback: ${fallbackSlug}`);
+    return fallbackSlug;
   }
 };
 
@@ -148,7 +205,40 @@ const SELECTORS = {
   nextMarketButton: 'a[href*="btc-updown-5m-"]' // ✅ Matches any link with "btc-updown-5m-" followed by timestamp
 };
 
+// Generate unique instance ID for this tab
+const INSTANCE_ID = `bot_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+console.log(`[Bot] Instance ID: ${INSTANCE_ID}`);
+
+// Detect current market type from URL
+function detectMarketType() {
+  const url = window.location.href;
+  if (url.includes('btc-updown-5m')) return 'BTC';
+  if (url.includes('eth-updown-5m')) return 'ETH';
+  if (url.includes('sol-updown-5m')) return 'SOL';
+  if (url.includes('xrp-updown-5m')) return 'XRP';
+  if (url.includes('doge-updown-5m')) return 'DOGE';
+  return 'BTC'; // Default
+}
+
+// Initialize market type (async) with a promise we can await
+window.MARKET_TYPE_READY = (async function() {
+  const { selectedMarket } = await chrome.storage.local.get('selectedMarket');
+  if (selectedMarket) {
+    window.MARKET_TYPE = selectedMarket;
+    console.log(`[Bot] Using stored market preference: ${window.MARKET_TYPE}`);
+  } else {
+    window.MARKET_TYPE = detectMarketType();
+    console.log(`[Bot] Detected market from URL: ${window.MARKET_TYPE}`);
+  }
+  return window.MARKET_TYPE;
+})();
+
+// Set initial value synchronously (will be updated by async function above)
+window.MARKET_TYPE = detectMarketType();
+
 let botState = {
+  instanceId: INSTANCE_ID,
+  get marketType() { return window.MARKET_TYPE; }, // Dynamic getter
   isRunning: false,
   settings: {},
   currentStake: 1.0,
@@ -156,7 +246,9 @@ let botState = {
   scalingExecuted: false,
   martingaleStep: 0,
   lastTradeWon: null,
-  checkInterval: null
+  checkInterval: null,
+  stakePreFilled: false,
+  tradeDirection: null // Track which direction we traded for win/loss detection
 };
 
 // Listen for messages from popup
@@ -185,57 +277,89 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 // Initialize bot on page load
 (async function init() {
-  // Load settings and bot state from storage
-  const data = await chrome.storage.local.get([
-    'stake',
-    'probMin',
-    'probMax',
-    'timeMin',
-    'timeMax',
-    'scalingEnabled',
-    'scaleProb',
-    'scaleStake',
-    'martingaleEnabled',
-    'martingaleMultiplier',
-    'martingaleMaxSteps',
-    'botRunning',
-    'martingaleStep'
-  ]);
+  // Load settings per market type (e.g., 'settings_BTC', 'settings_ETH')
+  const settingsKey = `settings_${window.MARKET_TYPE}`;
+  const martingaleKey = `martingale_${window.MARKET_TYPE}`;
+
+  const data = await chrome.storage.local.get([settingsKey, martingaleKey]);
+
+  // Get market-specific settings or use defaults
+  const savedSettings = data[settingsKey] || {};
+  const savedMartingale = data[martingaleKey] || {};
 
   botState.settings = {
-    stake: data.stake || 1.0,
-    probMin: data.probMin || 0.70,
-    probMax: data.probMax || 0.78,
-    timeMin: data.timeMin || 180,
-    timeMax: data.timeMax || 300,
-    scalingEnabled: data.scalingEnabled || false,
-    scaleProb: data.scaleProb || 0.80,
-    scaleStake: data.scaleStake || 5.0,
-    martingaleEnabled: data.martingaleEnabled || false,
-    martingaleMultiplier: data.martingaleMultiplier || 2.0,
-    martingaleMaxSteps: data.martingaleMaxSteps || 3
+    stake: savedSettings.stake || 1.0,
+    probMin: savedSettings.probMin || 0.70,
+    probMax: savedSettings.probMax || 0.78,
+    timeMin: savedSettings.timeMin || 180,
+    timeMax: savedSettings.timeMax || 300,
+    scalingEnabled: savedSettings.scalingEnabled || false,
+    scaleProb: savedSettings.scaleProb || 0.80,
+    scaleStake: savedSettings.scaleStake || 5.0,
+    martingaleEnabled: savedSettings.martingaleEnabled || false,
+    martingaleMultiplier: savedSettings.martingaleMultiplier || 2.0,
+    martingaleMaxSteps: savedSettings.martingaleMaxSteps || 3
   };
 
-  botState.martingaleStep = data.martingaleStep || 0;
+  botState.martingaleStep = savedMartingale.step || 0;
+  botState.lastTradeWon = savedMartingale.lastWon || null;
 
-  // Auto-start if bot was running before
-  if (data.botRunning) {
-    startBot();
-  }
-
-  console.log('[Bot] Initialized with settings:', botState.settings);
+  // DO NOT auto-start - wait for user to click START button
+  console.log(`[Bot] Initialized for ${window.MARKET_TYPE} market with settings:`, botState.settings);
 })();
 
-function startBot() {
+async function startBot() {
   if (botState.isRunning) {
     console.log('[Bot] Already running');
     return;
   }
 
   console.log('[Bot] Starting...');
+
+  // CRITICAL: Wait for market type to be initialized from storage
+  await window.MARKET_TYPE_READY;
+  console.log('[Bot] Market type initialized from storage');
+
+  // CRITICAL: Check if we're on a valid market page BEFORE starting
+  console.log('[Bot] startBot called. window.MARKET_TYPE =', window.MARKET_TYPE);
+  const currentUrl = window.location.href;
+  const marketSlug = `${window.MARKET_TYPE.toLowerCase()}-updown-5m-`;
+  console.log('[Bot] Looking for market slug:', marketSlug);
+  console.log('[Bot] Current URL:', currentUrl);
+  const isCorrectMarketPage = currentUrl.includes(marketSlug);
+  console.log('[Bot] Is correct market page?', isCorrectMarketPage);
+
+  if (!isCorrectMarketPage) {
+    console.log(`[Bot] Not on a ${window.MARKET_TYPE} 5-min market page, navigating to active market first...`);
+    sendStatusUpdate('warning', `Navigating to active ${window.MARKET_TYPE} market...`);
+
+    try {
+      const activeSlug = await POLYMARKET_API.getCurrentActiveMarketSlug(window.MARKET_TYPE);
+      const activeUrl = `https://polymarket.com/event/${activeSlug}`;
+      console.log(`[Bot] Redirecting to: ${activeSlug}`);
+
+      // Only navigate if we're not already going to this URL
+      if (!currentUrl.includes(activeSlug)) {
+        // Set flag so bot auto-starts after navigation
+        await chrome.storage.local.set({ botRunning: true });
+        window.location.href = activeUrl;
+        return; // Stop here, bot will auto-start on new page
+      } else {
+        console.log('[Bot] Already on target market, continuing...');
+      }
+    } catch (error) {
+      console.error(`[Bot] Failed to find active ${window.MARKET_TYPE} market:`, error);
+      sendStatusUpdate('error', `Failed to find active ${window.MARKET_TYPE} market`);
+      return;
+    }
+  }
+
   botState.isRunning = true;
   botState.tradeExecuted = false;
   botState.scalingExecuted = false;
+
+  // Restore martingale state from storage
+  restoreMartingaleState();
 
   // Start monitoring loop (check every 500ms)
   botState.checkInterval = setInterval(monitorMarket, 500);
@@ -295,11 +419,11 @@ async function checkForMarketResolution() {
 
       // Wait a bit for resolution
       setTimeout(async () => {
-        const nextSlug = await POLYMARKET_API.getNextMarketSlug();
-        if (nextSlug) {
-          console.log('[Bot] Navigating to next market:', nextSlug);
-          sendStatusUpdate('soft', `Navigating to: ${nextSlug}`);
-          window.location.href = `https://polymarket.com/event/${nextSlug}`;
+        const activeSlug = await POLYMARKET_API.getCurrentActiveMarketSlug(window.MARKET_TYPE);
+        if (activeSlug) {
+          console.log('[Bot] Navigating to active market:', activeSlug);
+          sendStatusUpdate('soft', `Navigating to: ${activeSlug}`);
+          window.location.href = `https://polymarket.com/event/${activeSlug}`;
         }
       }, 10000); // Wait 10 seconds for market to resolve
     }
@@ -322,11 +446,33 @@ async function monitorMarket() {
     const upProb = await getProbability('UP');
     const downProb = await getProbability('DOWN');
 
+    // CRITICAL: Validate we're in a proper 5-min market (0-300 seconds)
+    if (timeRemaining > 300) {
+      console.log(`[Bot] ⚠️ Invalid market: Timer shows ${Math.floor(timeRemaining/60)}m ${timeRemaining%60}s (>5min). Navigating to current market...`);
+      sendStatusUpdate('error', `Wrong market detected (>${Math.floor(timeRemaining/60)}min), navigating to correct one...`);
+      navigateToNextMarket();
+      return;
+    }
+
     // Check if market has resolved (timer reached 0)
     if (timeRemaining <= 0) {
       console.log('[Bot] Market resolved, navigating to next market...');
       navigateToNextMarket();
       return;
+    }
+
+    // Calculate current stake (considering martingale)
+    botState.currentStake = botState.settings.stake * Math.pow(botState.settings.martingaleMultiplier, botState.martingaleStep);
+
+    // PRE-FILL STAKE INPUT at market start (only once)
+    if (!botState.stakePreFilled && elapsed >= 5) { // Wait 5 seconds into market to ensure page is loaded
+      try {
+        fillStakeInput(botState.currentStake);
+        botState.stakePreFilled = true;
+        console.log(`[Bot] 💰 Pre-filled stake input with $${botState.currentStake.toFixed(2)}`);
+      } catch (error) {
+        console.log(`[Bot] Could not pre-fill stake (will try again): ${error.message}`);
+      }
     }
 
     // Check if we're in the entry time window
@@ -336,9 +482,6 @@ async function monitorMarket() {
       // Silent wait - don't spam console
       return;
     }
-
-    // Calculate current stake (considering martingale)
-    botState.currentStake = botState.settings.stake * Math.pow(botState.settings.martingaleMultiplier, botState.martingaleStep);
 
     // Check for initial entry
     if (!botState.tradeExecuted) {
@@ -385,26 +528,26 @@ function executeTrade(direction, probability) {
 
   // Mark as executed IMMEDIATELY to prevent duplicates
   botState.tradeExecuted = true;
+  botState.tradeDirection = direction; // Track direction for win/loss detection
 
   try {
-    // Fill stake input first
+    // Stake should already be pre-filled, but refill to ensure correct amount
     fillStakeInput(botState.currentStake);
 
-    // Wait longer for input to register and UI to update
-    setTimeout(() => {
-      clickTradeButton(direction);
+    // NO DELAY - stake was pre-filled, just click immediately
+    clickTradeButton(direction);
 
-      // Confirm trade was placed
-      setTimeout(() => {
-        sendStatusUpdate('trade_placed', `✅ ${direction} trade: $${botState.currentStake} @ ${(probability * 100).toFixed(1)}%`);
-      }, 1000);
-    }, 800); // Increased from 300ms to 800ms
+    // Confirm trade was placed
+    setTimeout(() => {
+      sendStatusUpdate('trade_placed', `✅ ${direction} trade: $${botState.currentStake} @ ${(probability * 100).toFixed(1)}%`);
+    }, 500);
 
   } catch (error) {
     console.error('[Bot] ❌ Trade execution error:', error);
     sendStatusUpdate('error', `Trade failed: ${error.message}`);
     // Reset flag on error
     botState.tradeExecuted = false;
+    botState.tradeDirection = null;
   }
 }
 
@@ -628,34 +771,91 @@ function clickTradeButton(direction) {
         console.log(`========== ORDER PLACEMENT FAILED ==========\n`);
         throw error;
       }
-    }, 400); // Wait 400ms after finding button before clicking
+    }, 100); // Wait 100ms after finding button before clicking
 
-  }, 500); // Wait 500ms after selection button click to let Place Order button appear
+  }, 150); // Wait 150ms after selection button click to let Place Order button appear
 }
 
 // Expose for manual trading from panel
 window.clickTradeButton = clickTradeButton;
 
+// Detect win/loss by checking which outcome won (UP or DOWN)
+async function detectTradeResult() {
+  if (!botState.tradeDirection) {
+    console.log('[Bot] No trade was placed, skipping win/loss detection');
+    return null;
+  }
+
+  try {
+    // Get the final market data to see which side won
+    const data = await POLYMARKET_API.getCurrentMarketData();
+
+    if (!data || !data.outcome) {
+      console.log('[Bot] Cannot determine outcome yet, market may not be fully resolved');
+      return null;
+    }
+
+    // Polymarket outcome: "Yes" = UP won, "No" = DOWN won
+    const marketWinner = data.outcome === 'Yes' ? 'UP' : 'DOWN';
+    const won = marketWinner === botState.tradeDirection;
+
+    console.log(`[Bot] 🏁 Market Result: ${marketWinner} won. We traded ${botState.tradeDirection}. ${won ? '✅ WON' : '❌ LOST'}`);
+
+    return won;
+  } catch (error) {
+    console.error('[Bot] Error detecting trade result:', error);
+    return null;
+  }
+}
+
 async function navigateToNextMarket() {
   try {
-    // Get next market slug from API
-    const nextSlug = await POLYMARKET_API.getNextMarketSlug();
-    const nextUrl = `https://polymarket.com/event/${nextSlug}`;
+    // DETECT WIN/LOSS before navigating (if martingale enabled)
+    if (botState.settings.martingaleEnabled && botState.tradeExecuted) {
+      const won = await detectTradeResult();
 
-    console.log(`[Bot] Navigating to next market: ${nextSlug}`);
+      if (won !== null) {
+        if (won) {
+          // Won - reset martingale
+          console.log(`[Bot] 🎉 Trade won! Resetting martingale step to 0`);
+          botState.martingaleStep = 0;
+          botState.lastTradeWon = true;
+        } else {
+          // Lost - increase martingale step
+          if (botState.martingaleStep < botState.settings.martingaleMaxSteps) {
+            botState.martingaleStep++;
+            console.log(`[Bot] 😞 Trade lost. Increasing martingale step to ${botState.martingaleStep}`);
+          } else {
+            console.log(`[Bot] ⚠️ Trade lost but already at max martingale steps (${botState.settings.martingaleMaxSteps})`);
+          }
+          botState.lastTradeWon = false;
+        }
+      }
+    }
+
+    // Get CURRENT ACTIVE market slug (not necessarily "next")
+    const activeSlug = await POLYMARKET_API.getCurrentActiveMarketSlug(window.MARKET_TYPE);
+    const activeUrl = `https://polymarket.com/event/${activeSlug}`;
+
+    console.log(`[Bot] Navigating to active ${window.MARKET_TYPE} market: ${activeSlug}`);
 
     // Reset trade state for new market
     botState.tradeExecuted = false;
     botState.scalingExecuted = false;
+    botState.stakePreFilled = false;
+    botState.tradeDirection = null;
     cachedMarketData = null; // Clear cache
 
-    sendStatusUpdate('next_market', `Moving to next market: ${nextSlug}`);
+    // Persist martingale state before navigation
+    await saveMartingaleState();
 
-    // Navigate to next market
-    window.location.href = nextUrl;
+    sendStatusUpdate('next_market', `Moving to active market: ${activeSlug}`);
+
+    // Navigate to active market
+    window.location.href = activeUrl;
 
   } catch (error) {
-    console.error('[Bot] Error navigating to next market:', error);
+    console.error('[Bot] Error navigating to active market:', error);
     stopBot();
   }
 }
@@ -668,7 +868,47 @@ function sendStatusUpdate(status, details) {
   });
 }
 
-// Export for debugging in console
+// Martingale persistence functions (per market)
+async function saveMartingaleState() {
+  const martingaleKey = `martingale_${MARKET_TYPE}`;
+  await chrome.storage.local.set({
+    [martingaleKey]: {
+      step: botState.martingaleStep,
+      lastWon: botState.lastTradeWon
+    }
+  });
+  console.log(`[Bot] Saved ${window.MARKET_TYPE} martingale state: step=${botState.martingaleStep}, lastWon=${botState.lastTradeWon}`);
+}
+
+async function restoreMartingaleState() {
+  const martingaleKey = `martingale_${MARKET_TYPE}`;
+  const data = await chrome.storage.local.get([martingaleKey]);
+  const savedMartingale = data[martingaleKey] || {};
+
+  if (savedMartingale.step !== undefined) {
+    botState.martingaleStep = savedMartingale.step;
+    botState.lastTradeWon = savedMartingale.lastWon;
+    console.log(`[Bot] Restored ${window.MARKET_TYPE} martingale state: step=${savedMartingale.step}, lastWon=${savedMartingale.lastWon}`);
+  }
+}
+
+// Handle tab visibility changes - resume bot when tab becomes active
+document.addEventListener('visibilitychange', async () => {
+  if (!document.hidden && botState.isRunning) {
+    console.log('[Bot] Tab became visible, resuming monitoring...');
+    sendStatusUpdate('running', 'Bot resumed (tab became active)');
+
+    // Ensure interval is running
+    if (!botState.checkInterval) {
+      botState.checkInterval = setInterval(monitorMarket, 500);
+    }
+  } else if (document.hidden && botState.isRunning) {
+    console.log('[Bot] ⚠️ Tab hidden - bot will pause until tab is active again');
+    sendStatusUpdate('warning', 'Bot paused (tab hidden - Chrome limitation)');
+  }
+});
+
+// Export for debugging in console and panel access
 window.polymarketBot = {
   start: startBot,
   stop: stopBot,
@@ -676,4 +916,11 @@ window.polymarketBot = {
   selectors: SELECTORS
 };
 
-console.log('[Polymarket Bot] Ready. Access via window.polymarketBot');
+// Expose API, state, and functions for panel.js
+window.POLYMARKET_API = POLYMARKET_API;
+// window.MARKET_TYPE already set above
+window.INSTANCE_ID = INSTANCE_ID;
+window.startBot = startBot;
+window.stopBot = stopBot;
+
+console.log(`[Polymarket Bot] Ready for ${window.MARKET_TYPE} market. Instance: ${INSTANCE_ID}`);

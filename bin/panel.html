@@ -2,7 +2,7 @@
   <div class="panel-header" id="panel-header">
     <div class="panel-title" style="cursor: move;">
       <span class="panel-icon">⚡</span>
-      <span>Bot V2.0 NEW</span>
+      <span id="panelMarketTitle">Bot V2.0</span>
     </div>
     <div class="panel-controls">
       <button class="panel-btn minimize" id="minimizeBtn" title="Minimize">−</button>
@@ -11,6 +11,18 @@
   </div>
 
   <div class="panel-content" id="panel-content">
+    <!-- Market Selector -->
+    <div class="market-selector">
+      <label style="font-size: 11px; color: #888; margin-bottom: 4px; display: block;">Market:</label>
+      <select id="marketTypeSelector" style="width: 100%; padding: 6px; background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 4px; color: #22c55e; font-weight: 600; font-size: 13px; cursor: pointer;">
+        <option value="BTC">BTC (Bitcoin)</option>
+        <option value="ETH">ETH (Ethereum)</option>
+        <option value="SOL">SOL (Solana)</option>
+        <option value="XRP">XRP (Ripple)</option>
+        <option value="DOGE">DOGE (Dogecoin)</option>
+      </select>
+    </div>
+
     <!-- Market Info -->
     <div class="market-info-compact">
       <div class="info-row">
@@ -136,6 +148,14 @@
 
 .panel-content.minimized {
   display: none;
+}
+
+.market-selector {
+  background: #1a1a1a;
+  padding: 10px;
+  border-radius: 6px;
+  margin-bottom: 10px;
+  border: 1px solid #2a2a2a;
 }
 
 .market-info-compact {
